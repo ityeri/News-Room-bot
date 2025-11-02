@@ -13,6 +13,9 @@ import html
 import nltk
 from newspaper import Article as Article3k
 from playwright.async_api import async_playwright
+from .models import init_db, NewsHistory
+from sqlalchemy import select
+
 
 nltk.download('punkt_tab', quiet=True)
 nltk.download('punkt', quiet=True)
@@ -402,13 +405,17 @@ class NewsCog(commands.Cog):
                 print(f"오류: DISCORD_CHANNEL_ID가 올바른 숫자 형식이 아닙니다. (값: {self.CHANNEL_ID_STR})")
                 return
         
-        self.history_file = "news_history.json"
-        self.sent_urls_history = {}  # {url: message_id} 형태로 변경
+        # JSON 파일 관련 코드 제거
+        # self.history_file = "news_history.json"
+        # self.sent_urls_history = {}
+        
+        # DB 세션 초기화
+        self.db_session_maker = None
         
         self.model = self._initialize_ai_model()
         
         self.loop = asyncio.get_event_loop()
-        self.loop.create_task(self._load_history())
+        self.loop.create_task(self._init_database())
 
     def _initialize_ai_model(self):
         """환경 변수 GEMINI_API_KEY로 AI 모델 초기화"""
@@ -423,41 +430,43 @@ class NewsCog(commands.Cog):
         except Exception as e:
             print(f"✗ Gemini 모델 초기화 오류: {e}")
             return None
+        
+    async def _init_database(self):
+        """데이터베이스 초기화 및 세션 메이커 생성"""
+        await self.bot.wait_until_ready()
+        try:
+            self.db_session_maker = await init_db("news_history.db")
+            
+            # 기존 레코드 수 확인
+            async with self.db_session_maker() as session:
+                result = await session.execute(select(NewsHistory))
+                count = len(result.scalars().all())
+                print(f"✓ 데이터베이스 초기화 완료. (총 {count}개 레코드)")
+        except Exception as e:
+            print(f"데이터베이스 초기화 오류: {e}")
 
-    async def _load_history(self):
-        """news_history.json 파일에서 전송 이력 로드"""
-        await self.bot.wait_until_ready() 
-        if not os.path.exists(self.history_file):
-            print(f"경고: {self.history_file} 파일이 존재하지 않습니다.")
+    # URL 확인 메서드 (새로 추가)
+    async def _is_url_sent(self, url: str) -> bool:
+        """URL이 이미 전송되었는지 확인"""
+        if not self.db_session_maker:
+            return False
+        
+        async with self.db_session_maker() as session:
+            result = await session.execute(
+                select(NewsHistory).where(NewsHistory.url == url)
+            )
+            return result.scalar_one_or_none() is not None
+
+    # URL 저장 메서드 (새로 추가)
+    async def _save_sent_url(self, url: str, message_id: str = None):
+        """전송된 URL을 데이터베이스에 저장"""
+        if not self.db_session_maker:
             return
-
-        try:
-            with open(self.history_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # 이전 버전 호환성 처리
-                sent_urls = data.get("sent_urls", [])
-                if isinstance(sent_urls, dict):
-                    # 딕셔너리 형태면 리스트로 변환 (URL만 저장)
-                    self.sent_urls_history = list(sent_urls.keys())
-                else:
-                    self.sent_urls_history = sent_urls
-                print(f"✓ 뉴스 이력 로드 완료. (총 {len(self.sent_urls_history)}개)")
-        except json.JSONDecodeError:
-            print(f"오류: {self.history_file} 파일이 손상되었습니다. 초기화합니다.")
-            self.sent_urls_history = {}
-        except Exception as e:
-            print(f"이력 로드 중 오류 발생: {e}")
-
-    async def _save_history(self):
-        """전송 이력을 news_history.json 파일에 저장"""
-        data = {
-            "sent_urls": self.sent_urls_history  # 이제 리스트
-        }
-        try:
-            with open(self.history_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"이력 저장 중 오류 발생: {e}")
+        
+        async with self.db_session_maker() as session:
+            news_record = NewsHistory(url=url, message_id=message_id)
+            session.add(news_record)
+            await session.commit()
 
     async def fetch_naver_news(self, query="IT 기술 인공지능 소프트웨어 -경제 -주식 -투자", display=10):
         """네이버 뉴스 API에서 IT 기술 뉴스 검색 (더 많은 결과 가져오기)"""
@@ -602,8 +611,8 @@ class NewsCog(commands.Cog):
             news_description = item.get("description", "")
             news_description = html.unescape(news_description)  # HTML 엔티티 디코딩
             
-            # 이미 전송된 뉴스인지 확인
-            if news_url in self.sent_urls_history:
+            # 이미 전송된 뉴스인지 확인 (DB 조회)
+            if await self._is_url_sent(news_url):
                 print(f"  -> 이미 전송된 기사. 건너뜀: {news_provider} - {news_title}")
                 continue
 
@@ -662,10 +671,14 @@ class NewsCog(commands.Cog):
                     except discord.errors.HTTPException as e:
                         print(f"⚠ 메시지 발행 실패: {e}")
                 
-                # 전송 성공 후 이력에 추가 (URL만 리스트에)
-                self.sent_urls_history.append(news_url)
-                await self._save_history()
-                print(f"✓ 상태 저장 완료. (총 {len(self.sent_urls_history)}개)")
+                # 전송 성공 후 DB에 저장
+                await self._save_sent_url(news_url, str(message.id))
+                
+                # 전체 레코드 수 확인
+                async with self.db_session_maker() as session:
+                    result = await session.execute(select(NewsHistory))
+                    count = len(result.scalars().all())
+                    print(f"✓ 데이터베이스 저장 완료. (총 {count}개)")
                 
                 # 하나 처리 후 종료
                 return

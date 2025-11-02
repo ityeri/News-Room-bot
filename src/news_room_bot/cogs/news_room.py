@@ -568,7 +568,7 @@ class NewsCog(commands.Cog):
         """Cog가 언로드될 때 실행"""
         self.send_news_loop.stop()
 
-    @tasks.loop(minutes=120.0)
+    @tasks.loop(minutes=30.0)
     async def send_news_loop(self):
         """120분마다 최신 뉴스를 확인하고 채널에 전송"""
         await self.bot.wait_until_ready()
@@ -681,4 +681,5 @@ class NewsCog(commands.Cog):
         print("처리할 새로운 IT 뉴스를 찾지 못했습니다.")
 
 async def setup(bot):
+
     await bot.add_cog(NewsCog(bot))
